@@ -1,0 +1,23 @@
+[package]
+name = "burrow-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable tunnel client library — expose your local server to the internet"
+
+[dependencies]
+burrow-core = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tungstenite = { workspace = true }
+yamux = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }

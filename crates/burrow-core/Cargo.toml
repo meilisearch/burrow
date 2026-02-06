@@ -1,0 +1,11 @@
+[package]
+name = "burrow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core protocol types for the burrow tunnel system"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

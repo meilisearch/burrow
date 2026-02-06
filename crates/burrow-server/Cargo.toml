@@ -1,0 +1,26 @@
+[package]
+name = "burrow-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tunnel server — accept client connections and route HTTP traffic by subdomain"
+
+[dependencies]
+burrow-core = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tungstenite = { workspace = true }
+yamux = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
