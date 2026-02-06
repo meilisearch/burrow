@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -14,9 +15,12 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{error, info};
 
-use burrow_core::{ClientMessage, ServerMessage, TUNNEL_WS_PATH};
+use burrow_core::{ClientMessage, ServerMessage, TunnelRequest, TunnelResponse, TUNNEL_WS_PATH};
 
 use crate::tunnel::{self, TunnelRegistry};
+
+const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 pub struct ServerConfig {
     pub domain: String,
@@ -89,21 +93,87 @@ async fn handle_request(
         return Ok(response(StatusCode::NOT_FOUND, format!("tunnel '{subdomain}' not found")));
     };
 
-    // Notify the tunnel client about the new connection.
-    // TODO: In the full implementation, we'd open a yamux stream here,
-    // forward the entire HTTP request through it, and stream back the response.
-    match tunnel.send_new_connection().await {
-        Ok((stream_id, _rx)) => {
-            info!(subdomain = %subdomain, %stream_id, "visitor request forwarded");
-            // TODO: wait on `rx` for the proxied response.
-            // For now, return a placeholder.
-            Ok(response(StatusCode::BAD_GATEWAY, "tunnel proxy not yet implemented"))
-        }
+    // Convert the incoming hyper request to a TunnelRequest.
+    let tunnel_request = match request_to_tunnel(req).await {
+        Ok(r) => r,
         Err(e) => {
-            error!(subdomain = %subdomain, error = %e, "failed to notify tunnel client");
-            Ok(response(StatusCode::BAD_GATEWAY, "tunnel client unreachable"))
+            error!(subdomain = %subdomain, error = %e, "failed to read visitor request");
+            return Ok(response(StatusCode::BAD_REQUEST, "bad request"));
+        }
+    };
+
+    // Send to the tunnel client and wait for a response.
+    let (stream_id, rx) = match tunnel.send_new_connection_with_request(&tunnel_request).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!(subdomain = %subdomain, error = %e, "failed to send to tunnel client");
+            return Ok(response(StatusCode::BAD_GATEWAY, "tunnel client unreachable"));
+        }
+    };
+
+    info!(subdomain = %subdomain, %stream_id, "visitor request forwarded");
+
+    // Wait for the client's response with a timeout.
+    match tokio::time::timeout(PROXY_TIMEOUT, rx).await {
+        Ok(Ok(tunnel_resp)) => Ok(tunnel_response_to_hyper(tunnel_resp)),
+        Ok(Err(_recv_err)) => {
+            // The sender was dropped — client disconnected
+            tunnel.cancel_pending(&stream_id).await;
+            Ok(response(StatusCode::BAD_GATEWAY, "tunnel client disconnected"))
+        }
+        Err(_timeout) => {
+            tunnel.cancel_pending(&stream_id).await;
+            Ok(response(StatusCode::GATEWAY_TIMEOUT, "tunnel client did not respond in time"))
         }
     }
+}
+
+/// Convert a hyper `Request<Incoming>` into a `TunnelRequest`.
+async fn request_to_tunnel(req: Request<Incoming>) -> Result<TunnelRequest> {
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+
+    let headers: Vec<(String, Vec<u8>)> = req
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect();
+
+    let body = http_body_util::BodyExt::collect(req.into_body())
+        .await
+        .context("failed to read request body")?
+        .to_bytes()
+        .to_vec();
+
+    if body.len() > MAX_BODY_SIZE {
+        anyhow::bail!("request body too large: {} bytes", body.len());
+    }
+
+    Ok(TunnelRequest {
+        method,
+        uri,
+        headers,
+        body,
+    })
+}
+
+/// Convert a `TunnelResponse` back into a hyper `Response`.
+fn tunnel_response_to_hyper(resp: TunnelResponse) -> Response<Full<Bytes>> {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status);
+
+    for (name, value) in &resp.headers {
+        builder = builder.header(name.as_str(), value.as_slice());
+    }
+
+    builder
+        .body(Full::new(Bytes::from(resp.body)))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from("failed to build response")))
+                .unwrap()
+        })
 }
 
 /// Handle a WebSocket upgrade request from a tunnel client.

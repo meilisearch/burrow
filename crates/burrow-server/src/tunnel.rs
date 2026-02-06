@@ -11,14 +11,14 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use burrow_core::{ClientMessage, ServerMessage};
+use burrow_core::{ClientMessage, ServerMessage, TunnelFrame, TunnelRequest, TunnelResponse, decode_frame, encode};
 
 /// A registered tunnel: holds the WebSocket sender and pending visitor requests.
 pub struct Tunnel {
     pub subdomain: String,
     ws_tx: Mutex<SplitSink<WebSocketStream<TokioIo<Upgraded>>, Message>>,
-    /// Pending visitor connections waiting for the client to accept.
-    pending: RwLock<HashMap<Uuid, oneshot::Sender<Vec<u8>>>>,
+    /// Pending visitor connections waiting for the client's response.
+    pending: RwLock<HashMap<Uuid, oneshot::Sender<TunnelResponse>>>,
 }
 
 impl Tunnel {
@@ -33,19 +33,37 @@ impl Tunnel {
         }
     }
 
-    /// Notify the tunnel client that a new visitor has arrived.
-    /// Returns a receiver that will eventually contain the response bytes.
-    pub async fn send_new_connection(&self) -> anyhow::Result<(Uuid, oneshot::Receiver<Vec<u8>>)> {
+    /// Notify the tunnel client about a new visitor connection and send the
+    /// request as a binary frame atomically (holding the ws_tx lock across both).
+    /// Returns a receiver that will contain the response from the client.
+    pub async fn send_new_connection_with_request(
+        &self,
+        request: &TunnelRequest,
+    ) -> anyhow::Result<(Uuid, oneshot::Receiver<TunnelResponse>)> {
         let stream_id = Uuid::new_v4();
         let (tx, rx) = oneshot::channel();
 
         self.pending.write().await.insert(stream_id, tx);
 
+        // Hold the lock across both sends for atomic delivery
+        let mut ws = self.ws_tx.lock().await;
+
+        // 1. Send the JSON NewConnection control message
         let msg = ServerMessage::NewConnection { stream_id };
         let text = serde_json::to_string(&msg)?;
-        self.ws_tx.lock().await.send(Message::Text(text.into())).await?;
+        ws.send(Message::Text(text.into())).await?;
+
+        // 2. Send the binary request frame immediately after
+        let frame = TunnelFrame::Request(request.clone());
+        let binary = encode(stream_id, &frame);
+        ws.send(Message::Binary(binary.into())).await?;
 
         Ok((stream_id, rx))
+    }
+
+    /// Cancel a pending visitor connection (e.g. on timeout).
+    pub async fn cancel_pending(&self, stream_id: &Uuid) {
+        self.pending.write().await.remove(stream_id);
     }
 
     /// Send a raw message to the tunnel client.
@@ -55,10 +73,12 @@ impl Tunnel {
         Ok(())
     }
 
-    /// Resolve a pending visitor connection with response data.
-    pub async fn resolve_connection(&self, stream_id: Uuid, data: Vec<u8>) {
+    /// Resolve a pending visitor connection with a tunnel response.
+    pub async fn resolve_connection(&self, stream_id: Uuid, response: TunnelResponse) {
         if let Some(tx) = self.pending.write().await.remove(&stream_id) {
-            let _ = tx.send(data);
+            let _ = tx.send(response);
+        } else {
+            warn!(%stream_id, "no pending connection for response");
         }
     }
 }
@@ -154,7 +174,7 @@ impl TunnelRegistry {
 }
 
 /// Handle a tunnel client's WebSocket connection after the handshake.
-/// Listens for Accept messages and heartbeats.
+/// Listens for Accept messages, heartbeats, and binary response frames.
 pub async fn handle_client_messages(
     tunnel: Arc<Tunnel>,
     mut ws_rx: futures_util::stream::SplitStream<WebSocketStream<TokioIo<Upgraded>>>,
@@ -188,9 +208,27 @@ pub async fn handle_client_messages(
                 }
             }
             Message::Binary(data) => {
-                // TODO: parse stream_id header from data and resolve the pending connection.
-                // For now, this is a placeholder for the yamux/binary data path.
-                let _ = data;
+                match decode_frame(&data) {
+                    Ok((stream_id, TunnelFrame::Response(resp))) => {
+                        tunnel.resolve_connection(stream_id, resp).await;
+                    }
+                    Ok((stream_id, TunnelFrame::Error(err))) => {
+                        warn!(%stream_id, message = %err.message, "client reported error");
+                        // Synthesize a 502 response for the visitor
+                        let resp = TunnelResponse {
+                            status: 502,
+                            headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                            body: format!("upstream error: {}", err.message).into_bytes(),
+                        };
+                        tunnel.resolve_connection(stream_id, resp).await;
+                    }
+                    Ok((stream_id, TunnelFrame::Request(_))) => {
+                        warn!(%stream_id, "unexpected request frame from client");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to decode binary frame");
+                    }
+                }
             }
             Message::Ping(data) => {
                 let _ = tunnel

@@ -9,3 +9,5 @@ description = "Core protocol types for the burrow tunnel system"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }

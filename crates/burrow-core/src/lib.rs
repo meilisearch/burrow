@@ -1,3 +1,6 @@
+mod frame;
+pub use frame::*;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

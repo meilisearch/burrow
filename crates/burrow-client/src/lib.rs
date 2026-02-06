@@ -1,14 +1,27 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::client::conn::http1;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{error, info, warn};
+use burrow_core::{
+    ClientMessage, ServerMessage, TunnelError, TunnelFrame, TunnelRequest, TunnelResponse,
+    TUNNEL_WS_PATH, decode_frame, encode,
+};
 
-use burrow_core::{ClientMessage, ServerMessage, TUNNEL_WS_PATH};
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 /// A handle to a running tunnel. Dropping it will close the tunnel.
 pub struct TunnelHandle {
@@ -133,20 +146,25 @@ async fn handshake(
     anyhow::bail!("WebSocket closed before handshake completed")
 }
 
-/// Main loop: listen for NewConnection messages and proxy each one.
+/// Main loop: listen for control messages and binary request frames,
+/// proxy each request to the local service, and send back the response.
 async fn tunnel_loop(
-    mut ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     local_addr: SocketAddr,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let (ws_tx, mut ws_rx) = ws.split();
+    let ws_tx = Arc::new(Mutex::new(ws_tx));
+
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 info!("tunnel shutting down");
-                let _ = ws.close(None).await;
+                let mut tx = ws_tx.lock().await;
+                let _ = tx.close().await;
                 return Ok(());
             }
-            frame = ws.next() => {
+            frame = ws_rx.next() => {
                 let Some(frame) = frame else {
                     warn!("tunnel WebSocket closed by server");
                     return Ok(());
@@ -158,16 +176,11 @@ async fn tunnel_loop(
                         match server_msg {
                             ServerMessage::NewConnection { stream_id } => {
                                 info!(%stream_id, "new visitor connection");
-                                let local = local_addr;
-                                tokio::spawn(async move {
-                                    if let Err(e) = proxy_connection(stream_id, local).await {
-                                        warn!(%stream_id, error = %e, "proxy connection failed");
-                                    }
-                                });
                             }
                             ServerMessage::Heartbeat => {
                                 let pong = serde_json::to_string(&ClientMessage::Heartbeat)?;
-                                let _ = ws.send(Message::Text(pong.into())).await;
+                                let mut tx = ws_tx.lock().await;
+                                let _ = tx.send(Message::Text(pong.into())).await;
                             }
                             ServerMessage::Error { message } => {
                                 error!(%message, "server error");
@@ -175,8 +188,16 @@ async fn tunnel_loop(
                             _ => {}
                         }
                     }
+                    Message::Binary(data) => {
+                        let ws_tx = ws_tx.clone();
+                        let local = local_addr;
+                        tokio::spawn(async move {
+                            handle_binary_frame(data.to_vec(), local, ws_tx).await;
+                        });
+                    }
                     Message::Ping(data) => {
-                        let _ = ws.send(Message::Pong(data)).await;
+                        let mut tx = ws_tx.lock().await;
+                        let _ = tx.send(Message::Pong(data)).await;
                     }
                     Message::Close(_) => {
                         info!("server closed tunnel");
@@ -189,21 +210,105 @@ async fn tunnel_loop(
     }
 }
 
-/// Proxy a single visitor connection: connect to the local service and relay bytes.
-///
-/// TODO: This is a placeholder. The full implementation will use yamux streams
-/// multiplexed over the WebSocket rather than separate TCP connections.
-/// For the initial version, the server sends the full HTTP request/response
-/// as binary WebSocket frames tagged with the stream_id.
-async fn proxy_connection(stream_id: uuid::Uuid, local_addr: SocketAddr) -> Result<()> {
-    let _local = TcpStream::connect(local_addr)
+/// Decode a binary request frame, proxy to local, and send back the response.
+async fn handle_binary_frame(data: Vec<u8>, local_addr: SocketAddr, ws_tx: Arc<Mutex<WsSink>>) {
+    let (stream_id, frame) = match decode_frame(&data) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, "failed to decode binary frame");
+            return;
+        }
+    };
+
+    let TunnelFrame::Request(request) = frame else {
+        warn!(%stream_id, "expected request frame, got something else");
+        return;
+    };
+
+    // Proxy to local service
+    let response_frame = match proxy_to_local(local_addr, &request).await {
+        Ok(resp) => TunnelFrame::Response(resp),
+        Err(e) => {
+            warn!(%stream_id, error = %e, "local proxy failed");
+            TunnelFrame::Error(TunnelError {
+                message: e.to_string(),
+            })
+        }
+    };
+
+    // Encode and send back
+    let binary = encode(stream_id, &response_frame);
+    let mut tx = ws_tx.lock().await;
+    if let Err(e) = tx.send(Message::Binary(binary.into())).await {
+        warn!(%stream_id, error = %e, "failed to send response frame");
+    }
+}
+
+/// Forward a TunnelRequest to the local service and collect the response.
+async fn proxy_to_local(
+    local_addr: SocketAddr,
+    request: &TunnelRequest,
+) -> Result<TunnelResponse> {
+    let stream = TcpStream::connect(local_addr)
         .await
         .context("failed to connect to local service")?;
 
-    info!(%stream_id, "connected to local service, proxying...");
+    let io = TokioIo::new(stream);
 
-    // TODO: Read from yamux stream, forward to local, relay response back.
-    // This will be implemented when we wire up the yamux multiplexing layer.
+    let (mut sender, conn) = http1::Builder::new()
+        .handshake::<_, Full<Bytes>>(io)
+        .await
+        .context("HTTP handshake with local service failed")?;
 
-    Ok(())
+    // Drive the connection in the background
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            warn!(error = %e, "local HTTP connection error");
+        }
+    });
+
+    // Build the hyper request from the TunnelRequest
+    let method: hyper::Method = request
+        .method
+        .parse()
+        .context("invalid HTTP method")?;
+
+    let mut builder = Request::builder().method(method).uri(&request.uri);
+
+    for (name, value) in &request.headers {
+        builder = builder.header(name.as_str(), value.as_slice());
+    }
+
+    let body = if request.body.is_empty() {
+        Full::new(Bytes::new())
+    } else {
+        Full::new(Bytes::from(request.body.clone()))
+    };
+
+    let hyper_req = builder.body(body).context("failed to build request")?;
+
+    // Send and collect response
+    let resp: Response<Incoming> = sender
+        .send_request(hyper_req)
+        .await
+        .context("local service request failed")?;
+
+    let status = resp.status().as_u16();
+    let headers: Vec<(String, Vec<u8>)> = resp
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect();
+
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .context("failed to read local response body")?
+        .to_bytes()
+        .to_vec();
+
+    Ok(TunnelResponse {
+        status,
+        headers,
+        body,
+    })
 }
