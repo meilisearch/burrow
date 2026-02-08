@@ -3,7 +3,9 @@ name = "burrow-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Tunnel server — accept client connections and route HTTP traffic by subdomain"
+publish = false
 
 [dependencies]
 burrow-core = { workspace = true }

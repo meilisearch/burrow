@@ -1,5 +1,8 @@
+pub use burrow_core;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -16,6 +19,9 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{error, info, warn};
+
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
 use burrow_core::{
     ClientMessage, ServerMessage, TunnelError, TunnelFrame, TunnelRequest, TunnelResponse,
     TUNNEL_WS_PATH, decode_frame, encode,
@@ -75,6 +81,10 @@ impl TunnelClient {
 
     /// Connect to the tunnel server and start forwarding traffic.
     /// Returns a [`TunnelHandle`] with the assigned public URL.
+    ///
+    /// The client automatically reconnects with exponential backoff if the
+    /// connection is lost (e.g. server restart). Reconnection stops when
+    /// [`TunnelHandle::close`] is called.
     pub async fn connect(self) -> Result<TunnelHandle> {
         let ws_url = format!(
             "{}/{}",
@@ -88,16 +98,21 @@ impl TunnelClient {
             .await
             .context("failed to connect to tunnel server")?;
 
-        let (assigned_url, ws) = handshake(ws, self.token, self.subdomain).await?;
+        let (assigned_url, ws) = handshake(
+            ws,
+            self.token.clone(),
+            self.subdomain.clone(),
+        )
+        .await?;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let local_addr = self.local_addr;
         let url = assigned_url.clone();
+        let token = self.token;
+        let subdomain = self.subdomain;
 
         let task = tokio::spawn(async move {
-            if let Err(e) = tunnel_loop(ws, local_addr, shutdown_rx).await {
-                error!(error = %e, "tunnel loop exited with error");
-            }
+            run_with_reconnect(ws, ws_url, token, subdomain, local_addr, shutdown_rx).await;
         });
 
         Ok(TunnelHandle {
@@ -105,6 +120,71 @@ impl TunnelClient {
             _task: task,
             shutdown_tx,
         })
+    }
+}
+
+/// Run the tunnel loop, reconnecting with exponential backoff on disconnect.
+async fn run_with_reconnect(
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws_url: String,
+    token: Option<String>,
+    subdomain: Option<String>,
+    local_addr: SocketAddr,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    // Run the first connection (already established by connect()).
+    if let Err(e) = tunnel_loop(ws, local_addr, shutdown_rx.clone()).await {
+        error!(error = %e, "tunnel loop exited with error");
+    }
+
+    // If shutdown was requested, don't reconnect.
+    if *shutdown_rx.borrow() {
+        return;
+    }
+
+    let mut backoff = BACKOFF_INITIAL;
+
+    loop {
+        warn!(delay = ?backoff, "connection lost, reconnecting");
+
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                info!("shutdown requested, stopping reconnection");
+                return;
+            }
+            _ = tokio::time::sleep(backoff) => {}
+        }
+
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        match connect_async(&ws_url).await {
+            Ok((ws, _)) => {
+                match handshake(ws, token.clone(), subdomain.clone()).await {
+                    Ok((_url, ws)) => {
+                        info!("reconnected to tunnel server");
+                        backoff = BACKOFF_INITIAL;
+
+                        if let Err(e) = tunnel_loop(ws, local_addr, shutdown_rx.clone()).await {
+                            error!(error = %e, "tunnel loop exited with error");
+                        }
+
+                        if *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "handshake failed after reconnect");
+                    }
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "reconnection failed");
+            }
+        }
+
+        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 

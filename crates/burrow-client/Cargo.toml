@@ -3,6 +3,7 @@ name = "burrow-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Embeddable tunnel client library — expose your local server to the internet"
 
 [dependencies]

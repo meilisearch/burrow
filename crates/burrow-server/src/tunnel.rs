@@ -83,6 +83,9 @@ impl Tunnel {
     }
 }
 
+/// Subdomains that cannot be claimed by tunnel clients.
+const RESERVED_SUBDOMAINS: &[&str] = &["new", "www", "api", "admin", "app"];
+
 /// Global registry of active tunnels, keyed by subdomain.
 pub struct TunnelRegistry {
     tunnels: RwLock<HashMap<String, Arc<Tunnel>>>,
@@ -141,10 +144,13 @@ impl TunnelRegistry {
     async fn assign_subdomain(&self, requested: Option<String>) -> String {
         if let Some(req) = requested {
             let normalized = req.to_lowercase();
-            if !self.tunnels.read().await.contains_key(&normalized) {
+            if RESERVED_SUBDOMAINS.contains(&normalized.as_str()) {
+                warn!(requested = %normalized, "requested subdomain is reserved, generating random one");
+            } else if !self.tunnels.read().await.contains_key(&normalized) {
                 return normalized;
+            } else {
+                warn!(requested = %normalized, "requested subdomain already taken, generating random one");
             }
-            warn!(requested = %normalized, "requested subdomain already taken, generating random one");
         }
         self.generate_random_subdomain().await
     }
