@@ -54,15 +54,13 @@ pub async fn run(config: ServerConfig) -> Result<()> {
                 async move { handle_request(req, registry, &domain, peer).await }
             });
 
-            #[allow(clippy::collapsible_if)]
             if let Err(e) = http1::Builder::new()
                 .serve_connection(io, service)
                 .with_upgrades()
                 .await
+                && !e.to_string().contains("connection closed")
             {
-                if !e.to_string().contains("connection closed") {
-                    error!(peer = %peer, error = %e, "connection error");
-                }
+                error!(peer = %peer, error = %e, "connection error");
             }
         });
     }
