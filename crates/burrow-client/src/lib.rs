@@ -1,3 +1,30 @@
+//! Embeddable tunnel client library for [burrow](https://github.com/meilisearch/burrow).
+//!
+//! Expose a local HTTP server to the internet through a public subdomain.
+//! Automatically reconnects with exponential backoff if the connection drops.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use burrow_client::TunnelClient;
+//! use std::net::SocketAddr;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! let local_addr: SocketAddr = "127.0.0.1:3000".parse()?;
+//!
+//! let handle = TunnelClient::new("wss://new.meilisearch.link", local_addr)
+//!     .subdomain("myapp")
+//!     .connect()
+//!     .await?;
+//!
+//! println!("Tunnel live at: {}", handle.url());
+//! tokio::signal::ctrl_c().await?;
+//! handle.close().await;
+//! # Ok(())
+//! # }
+//! ```
+
 pub use burrow_core;
 
 use std::net::SocketAddr;

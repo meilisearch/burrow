@@ -1,3 +1,9 @@
+//! Shared protocol types and binary frame encoding for the burrow tunnel system.
+//!
+//! This crate defines the control-plane messages ([`ClientMessage`], [`ServerMessage`])
+//! exchanged as JSON over WebSocket, and the data-plane binary framing
+//! ([`encode`], [`decode_frame`]) used to carry HTTP requests and responses.
+
 mod frame;
 pub use frame::*;
 
