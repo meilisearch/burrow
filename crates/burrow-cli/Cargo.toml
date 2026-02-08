@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "CLI tool to expose a local port through a burrow tunnel"
-publish = false
+
+[[bin]]
+name = "burrow"
+path = "src/main.rs"
 
 [dependencies]
 burrow-client = { workspace = true }
