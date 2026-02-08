@@ -23,8 +23,8 @@ use tracing::{error, info, warn};
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 use burrow_core::{
-    ClientMessage, ServerMessage, TunnelError, TunnelFrame, TunnelRequest, TunnelResponse,
-    TUNNEL_WS_PATH, decode_frame, encode,
+    ClientMessage, ServerMessage, TUNNEL_WS_PATH, TunnelError, TunnelFrame, TunnelRequest,
+    TunnelResponse, decode_frame, encode,
 };
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -98,12 +98,7 @@ impl TunnelClient {
             .await
             .context("failed to connect to tunnel server")?;
 
-        let (assigned_url, ws) = handshake(
-            ws,
-            self.token.clone(),
-            self.subdomain.clone(),
-        )
-        .await?;
+        let (assigned_url, ws) = handshake(ws, self.token.clone(), self.subdomain.clone()).await?;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let local_addr = self.local_addr;
@@ -160,25 +155,23 @@ async fn run_with_reconnect(
         }
 
         match connect_async(&ws_url).await {
-            Ok((ws, _)) => {
-                match handshake(ws, token.clone(), subdomain.clone()).await {
-                    Ok((_url, ws)) => {
-                        info!("reconnected to tunnel server");
-                        backoff = BACKOFF_INITIAL;
+            Ok((ws, _)) => match handshake(ws, token.clone(), subdomain.clone()).await {
+                Ok((_url, ws)) => {
+                    info!("reconnected to tunnel server");
+                    backoff = BACKOFF_INITIAL;
 
-                        if let Err(e) = tunnel_loop(ws, local_addr, shutdown_rx.clone()).await {
-                            error!(error = %e, "tunnel loop exited with error");
-                        }
-
-                        if *shutdown_rx.borrow() {
-                            return;
-                        }
+                    if let Err(e) = tunnel_loop(ws, local_addr, shutdown_rx.clone()).await {
+                        error!(error = %e, "tunnel loop exited with error");
                     }
-                    Err(e) => {
-                        error!(error = %e, "handshake failed after reconnect");
+
+                    if *shutdown_rx.borrow() {
+                        return;
                     }
                 }
-            }
+                Err(e) => {
+                    error!(error = %e, "handshake failed after reconnect");
+                }
+            },
             Err(e) => {
                 error!(error = %e, "reconnection failed");
             }
@@ -325,10 +318,7 @@ async fn handle_binary_frame(data: Vec<u8>, local_addr: SocketAddr, ws_tx: Arc<M
 }
 
 /// Forward a TunnelRequest to the local service and collect the response.
-async fn proxy_to_local(
-    local_addr: SocketAddr,
-    request: &TunnelRequest,
-) -> Result<TunnelResponse> {
+async fn proxy_to_local(local_addr: SocketAddr, request: &TunnelRequest) -> Result<TunnelResponse> {
     let stream = TcpStream::connect(local_addr)
         .await
         .context("failed to connect to local service")?;
@@ -348,10 +338,7 @@ async fn proxy_to_local(
     });
 
     // Build the hyper request from the TunnelRequest
-    let method: hyper::Method = request
-        .method
-        .parse()
-        .context("invalid HTTP method")?;
+    let method: hyper::Method = request.method.parse().context("invalid HTTP method")?;
 
     let mut builder = Request::builder().method(method).uri(&request.uri);
 

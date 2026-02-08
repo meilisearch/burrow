@@ -11,7 +11,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use burrow_core::{ClientMessage, ServerMessage, TunnelFrame, TunnelRequest, TunnelResponse, decode_frame, encode};
+use burrow_core::{
+    ClientMessage, ServerMessage, TunnelFrame, TunnelRequest, TunnelResponse, decode_frame, encode,
+};
 
 /// A registered tunnel: holds the WebSocket sender and pending visitor requests.
 pub struct Tunnel {
@@ -69,7 +71,11 @@ impl Tunnel {
     /// Send a raw message to the tunnel client.
     pub async fn send_message(&self, msg: &ServerMessage) -> anyhow::Result<()> {
         let text = serde_json::to_string(msg)?;
-        self.ws_tx.lock().await.send(Message::Text(text.into())).await?;
+        self.ws_tx
+            .lock()
+            .await
+            .send(Message::Text(text.into()))
+            .await?;
         Ok(())
     }
 
@@ -123,7 +129,10 @@ impl TunnelRegistry {
         let url = format!("https://{}.{}", subdomain, self.domain);
 
         let tunnel = Arc::new(Tunnel::new(subdomain.clone(), ws_tx));
-        self.tunnels.write().await.insert(subdomain.clone(), tunnel.clone());
+        self.tunnels
+            .write()
+            .await
+            .insert(subdomain.clone(), tunnel.clone());
 
         info!(subdomain = %subdomain, url = %url, "tunnel registered");
         Ok((subdomain, url, tunnel))
@@ -237,9 +246,7 @@ pub async fn handle_client_messages(
                 }
             }
             Message::Ping(data) => {
-                let _ = tunnel
-                    .send_message(&ServerMessage::Heartbeat)
-                    .await;
+                let _ = tunnel.send_message(&ServerMessage::Heartbeat).await;
                 let _ = data;
             }
             Message::Close(_) => {
