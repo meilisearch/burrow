@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{error, info};
 
-use burrow_core::{ClientMessage, ServerMessage, TunnelRequest, TunnelResponse, TUNNEL_WS_PATH};
+use burrow_core::{ClientMessage, ServerMessage, TUNNEL_WS_PATH, TunnelRequest, TunnelResponse};
 
 use crate::tunnel::{self, TunnelRegistry};
 
@@ -30,7 +30,10 @@ pub struct ServerConfig {
 
 pub async fn run(config: ServerConfig) -> Result<()> {
     let addr: SocketAddr = config.listen.parse().context("invalid listen address")?;
-    let registry = Arc::new(TunnelRegistry::new(config.domain.clone(), config.allowed_tokens));
+    let registry = Arc::new(TunnelRegistry::new(
+        config.domain.clone(),
+        config.allowed_tokens,
+    ));
 
     let listener = TcpListener::bind(addr).await?;
     info!(addr = %addr, domain = %config.domain, "burrow server listening");
@@ -55,10 +58,9 @@ pub async fn run(config: ServerConfig) -> Result<()> {
                 .serve_connection(io, service)
                 .with_upgrades()
                 .await
+                && !e.to_string().contains("connection closed")
             {
-                if !e.to_string().contains("connection closed") {
-                    error!(peer = %peer, error = %e, "connection error");
-                }
+                error!(peer = %peer, error = %e, "connection error");
             }
         });
     }
@@ -90,7 +92,10 @@ async fn handle_request(
     };
 
     let Some(tunnel) = registry.get(&subdomain).await else {
-        return Ok(response(StatusCode::NOT_FOUND, format!("tunnel '{subdomain}' not found")));
+        return Ok(response(
+            StatusCode::NOT_FOUND,
+            format!("tunnel '{subdomain}' not found"),
+        ));
     };
 
     // Convert the incoming hyper request to a TunnelRequest.
@@ -103,11 +108,17 @@ async fn handle_request(
     };
 
     // Send to the tunnel client and wait for a response.
-    let (stream_id, rx) = match tunnel.send_new_connection_with_request(&tunnel_request).await {
+    let (stream_id, rx) = match tunnel
+        .send_new_connection_with_request(&tunnel_request)
+        .await
+    {
         Ok(pair) => pair,
         Err(e) => {
             error!(subdomain = %subdomain, error = %e, "failed to send to tunnel client");
-            return Ok(response(StatusCode::BAD_GATEWAY, "tunnel client unreachable"));
+            return Ok(response(
+                StatusCode::BAD_GATEWAY,
+                "tunnel client unreachable",
+            ));
         }
     };
 
@@ -119,11 +130,17 @@ async fn handle_request(
         Ok(Err(_recv_err)) => {
             // The sender was dropped — client disconnected
             tunnel.cancel_pending(&stream_id).await;
-            Ok(response(StatusCode::BAD_GATEWAY, "tunnel client disconnected"))
+            Ok(response(
+                StatusCode::BAD_GATEWAY,
+                "tunnel client disconnected",
+            ))
         }
         Err(_timeout) => {
             tunnel.cancel_pending(&stream_id).await;
-            Ok(response(StatusCode::GATEWAY_TIMEOUT, "tunnel client did not respond in time"))
+            Ok(response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "tunnel client did not respond in time",
+            ))
         }
     }
 }
@@ -185,7 +202,10 @@ async fn handle_tunnel_upgrade(
         Ok(pair) => pair,
         Err(e) => {
             error!(error = %e, "WebSocket upgrade failed");
-            return Ok(self::response(StatusCode::BAD_REQUEST, "WebSocket upgrade failed"));
+            return Ok(self::response(
+                StatusCode::BAD_REQUEST,
+                "WebSocket upgrade failed",
+            ));
         }
     };
 
@@ -219,7 +239,10 @@ async fn handle_tunnel_client(
         if let tungstenite::Message::Text(text) = msg {
             let client_msg: ClientMessage = serde_json::from_str(&text)?;
             match client_msg {
-                ClientMessage::Hello { token, requested_subdomain } => {
+                ClientMessage::Hello {
+                    token,
+                    requested_subdomain,
+                } => {
                     break (token, requested_subdomain);
                 }
                 _ => continue,
@@ -235,17 +258,21 @@ async fn handle_tunnel_client(
         let mut ws_tx = ws_tx;
         use futures_util::SinkExt;
         let _ = ws_tx
-            .send(tungstenite::Message::Text(serde_json::to_string(&err)?.into()))
+            .send(tungstenite::Message::Text(
+                serde_json::to_string(&err)?.into(),
+            ))
             .await;
         anyhow::bail!("client auth failed");
     }
 
-    let (subdomain, url, tunnel_handle) =
-        registry.register(ws_tx, requested_subdomain).await?;
+    let (subdomain, url, tunnel_handle) = registry.register(ws_tx, requested_subdomain).await?;
 
     // Send the Assigned message.
     tunnel_handle
-        .send_message(&ServerMessage::Assigned { subdomain: subdomain.clone(), url })
+        .send_message(&ServerMessage::Assigned {
+            subdomain: subdomain.clone(),
+            url,
+        })
         .await?;
 
     // Enter the main loop handling client messages.
@@ -255,6 +282,7 @@ async fn handle_tunnel_client(
 }
 
 /// Perform a manual hyper WebSocket upgrade using tungstenite.
+#[allow(clippy::type_complexity)]
 fn hyper_tungstenite_upgrade(
     req: Request<Incoming>,
 ) -> Result<(

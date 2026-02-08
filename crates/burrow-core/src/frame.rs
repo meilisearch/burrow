@@ -1,4 +1,4 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use bytes::{Buf, BufMut, BytesMut};
 use uuid::Uuid;
 
@@ -75,7 +75,7 @@ pub fn encode(stream_id: Uuid, frame: &TunnelFrame) -> Vec<u8> {
 pub fn decode_frame(data: &[u8]) -> Result<(Uuid, TunnelFrame)> {
     ensure!(data.len() >= 17, "frame too short: need at least 17 bytes");
 
-    let mut buf = &data[..];
+    let mut buf = data;
 
     // stream_id
     let mut uuid_bytes = [0u8; 16];
